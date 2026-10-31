@@ -1,0 +1,13 @@
+// Le duas notas e calcula a media (usa scan)
+n1 = 0.0
+n2 = 0.0
+scan("Nota 1: " {float.n1})
+scan("Nota 2: " {float.n2})
+media = (n1 + n2) / 2
+printf("Media: {float.media}\n")
+if (media >= 6) {
+    printf("Aprovado!\n")
+} else {
+    printf("Reprovado.\n")
+}
+end(0)

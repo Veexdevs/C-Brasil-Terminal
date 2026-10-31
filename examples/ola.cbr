@@ -1,0 +1,5 @@
+// Primeiro programa em C-Brasil
+nome = "mundo"
+printf("Olá, {str.nome}!\n")
+printf("C-Brasil rodando no terminal.\n")
+end(0)

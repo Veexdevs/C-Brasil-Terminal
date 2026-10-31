@@ -1,0 +1,691 @@
+#!/usr/bin/env sh
+# ============================================================================
+#  cbrasil — executor da linguagem C-Brasil (como node, python, bash...)
+#
+#  Uso:       cbrasil programa.cbr
+#  Projeto:   https://github.com/Veexdevs/C-Brasil-Terminal
+#  Linguagem: https://github.com/vorgweb/C-Brasil
+#
+#  Este arquivo é autossuficiente: baixa/atualiza a linguagem, compila o
+#  tradutor e executa os programas. Basta copiá-lo para uma pasta do PATH.
+# ============================================================================
+
+set -u
+
+CBRAZIL_LAUNCHER_VERSION="1.0.0"
+CBRAZIL_HOME_DEFAULT="__CBRAZIL_HOME__"
+CBRAZIL_REPO_URL="${CBRAZIL_REPO_URL:-https://github.com/vorgweb/C-Brasil.git}"
+CBRAZIL_REPO_BRANCH="${CBRAZIL_REPO_BRANCH:-main}"
+CBRAZIL_TARBALL_URL="${CBRAZIL_TARBALL_URL:-https://codeload.github.com/vorgweb/C-Brasil/tar.gz/refs/heads/main}"
+CBRAZIL_UPDATE_INTERVAL="${CBRAZIL_UPDATE_INTERVAL:-21600}"
+CBRAZIL_CACHE_MAX="${CBRAZIL_CACHE_MAX:-200}"
+
+PROG="cbrasil"
+
+msg()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+warn() { printf '%s: aviso: %s\n' "$PROG" "$*" >&2; }
+err()  { printf '%s: erro: %s\n' "$PROG" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Caminhos
+# ---------------------------------------------------------------------------
+
+resolve_home() {
+    if [ -n "${CBRAZIL_HOME:-}" ]; then
+        CB_HOME=$CBRAZIL_HOME
+    elif [ "$CBRAZIL_HOME_DEFAULT" != "__CBRAZIL_HOME__" ]; then
+        CB_HOME=$CBRAZIL_HOME_DEFAULT
+    elif [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/share/cbrasil" ]; then
+        CB_HOME=$PREFIX/share/cbrasil
+    elif [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/cbrasil" ]; then
+        CB_HOME=${XDG_DATA_HOME:-$HOME/.local/share}/cbrasil
+    else
+        case "${PREFIX:-}" in
+            *com.termux*) CB_HOME=$PREFIX/share/cbrasil ;;
+            *) CB_HOME=${XDG_DATA_HOME:-$HOME/.local/share}/cbrasil ;;
+        esac
+    fi
+    CB_CACHE=${CBRAZIL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/cbrasil}
+    CB_TRANSLATOR=$CB_HOME/bin/cbr
+    CB_SRC=$CB_HOME/src
+    CB_LOG=$CB_HOME/update.log
+}
+
+ensure_dirs() {
+    mkdir -p "$CB_HOME" "$CB_HOME/bin" "$CB_CACHE" 2>/dev/null && return 0
+    err "não foi possível criar $CB_HOME"
+    err "defina CBRAZIL_HOME para uma pasta com permissão de escrita"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+pick_cc() {
+    if [ -n "${CC:-}" ]; then printf '%s\n' "$CC"; return 0; fi
+    for _c in cc gcc clang; do
+        if have "$_c"; then printf '%s\n' "$_c"; return 0; fi
+    done
+    return 1
+}
+
+hash_file() {
+    if have sha256sum; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif have shasum; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif have openssl; then
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    else
+        cksum "$1" | tr -d ' '
+    fi
+}
+
+download() { # download URL DESTINO
+    if have curl; then
+        curl -fsSL --connect-timeout 15 --max-time 180 "$1" -o "$2"
+    elif have wget; then
+        wget -q -T 180 -O "$2" "$1"
+    else
+        return 1
+    fi
+}
+
+with_timeout() { # with_timeout SEGUNDOS comando...
+    _secs=$1
+    shift
+    if have timeout; then
+        timeout "$_secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+build_id() {
+    _c=$(cat "$CB_HOME/.commit" 2>/dev/null || printf 'desconhecido')
+    printf '%s' "$_c" | cut -c1-16
+}
+
+friendly_date() {
+    _d=$(cat "$CB_HOME/.commit_date" 2>/dev/null || printf '')
+    [ -n "$_d" ] || { printf 'desconhecida'; return 0; }
+    if date -d "$_d" +%d/%m/%Y >/dev/null 2>&1; then
+        date -d "$_d" +%d/%m/%Y
+    elif date -j -f '%Y-%m-%dT%H:%M:%SZ' "$_d" +%d/%m/%Y >/dev/null 2>&1; then
+        date -j -f '%Y-%m-%dT%H:%M:%SZ' "$_d" +%d/%m/%Y
+    else
+        printf '%s' "$_d" | cut -c1-10
+    fi
+}
+
+translator_version() {
+    [ -x "$CB_TRANSLATOR" ] || { printf 'não instalado'; return 0; }
+    "$CB_TRANSLATOR" --version 2>/dev/null | head -n 1
+}
+
+short_commit() { printf '%s' "$1" | cut -c1-7; }
+
+# ---------------------------------------------------------------------------
+# Sincronização com https://github.com/vorgweb/C-Brasil
+# ---------------------------------------------------------------------------
+
+acquire_lock() {
+    _lock=$CB_HOME/.update.lock
+    if mkdir "$_lock" 2>/dev/null; then
+        printf '%s\n' "$$" > "$_lock/pid" 2>/dev/null || true
+        trap 'release_lock' EXIT INT TERM HUP
+        return 0
+    fi
+    _stale=$(find "$_lock" -maxdepth 0 -mmin +15 2>/dev/null)
+    if [ -n "$_stale" ]; then
+        rm -rf "$_lock"
+        if mkdir "$_lock" 2>/dev/null; then
+            printf '%s\n' "$$" > "$_lock/pid" 2>/dev/null || true
+            trap 'release_lock' EXIT INT TERM HUP
+            return 0
+        fi
+    fi
+    return 1
+}
+
+release_lock() { rm -rf "$CB_HOME/.update.lock" 2>/dev/null || true; }
+unlock() { release_lock; trap - EXIT INT TERM HUP; }
+
+# 0 = fonte nova (ou tradutor ausente), 2 = nada mudou, 1 = falha
+sync_source() {
+    _old=$(cat "$CB_HOME/.commit" 2>/dev/null || printf '')
+
+    # Modo desenvolvedor/offline: copia de uma pasta local.
+    if [ -n "${CBRAZIL_SOURCE_DIR:-}" ]; then
+        [ -f "$CBRAZIL_SOURCE_DIR/cbr.c" ] || {
+            err "CBRAZIL_SOURCE_DIR não contém cbr.c: $CBRAZIL_SOURCE_DIR"
+            return 1
+        }
+        _new=$(hash_file "$CBRAZIL_SOURCE_DIR/cbr.c")
+        if [ "$_new" = "$_old" ] && [ -x "$CB_TRANSLATOR" ]; then return 2; fi
+        rm -rf "$CB_SRC"
+        mkdir -p "$CB_SRC" || return 1
+        if ! ( cd "$CBRAZIL_SOURCE_DIR" && tar -cf - . ) 2>>"$CB_LOG" | ( cd "$CB_SRC" && tar -xf - ) 2>>"$CB_LOG"; then
+            err "falha ao copiar a fonte de $CBRAZIL_SOURCE_DIR"
+            return 1
+        fi
+        printf 'local-%s\n' "$_new" > "$CB_HOME/.commit.pending"
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$CB_HOME/.commit_date.pending" 2>/dev/null || true
+        return 0
+    fi
+
+    if have git; then
+        if [ -d "$CB_SRC/.git" ]; then
+            if ! with_timeout 120 git -C "$CB_SRC" fetch --depth=1 --quiet origin "$CBRAZIL_REPO_BRANCH" >>"$CB_LOG" 2>&1; then
+                return 1
+            fi
+            _new=$(git -C "$CB_SRC" rev-parse --verify FETCH_HEAD 2>/dev/null) || return 1
+        else
+            rm -rf "$CB_SRC"
+            if ! with_timeout 300 git clone --depth=1 --quiet --branch "$CBRAZIL_REPO_BRANCH" \
+                    "$CBRAZIL_REPO_URL" "$CB_SRC" >>"$CB_LOG" 2>&1; then
+                return 1
+            fi
+            _new=$(git -C "$CB_SRC" rev-parse HEAD 2>/dev/null) || return 1
+        fi
+        if [ "$_new" = "$_old" ] && [ -x "$CB_TRANSLATOR" ]; then return 2; fi
+        git -C "$CB_SRC" -c advice.detachedHead=false reset --hard --quiet "$_new" >>"$CB_LOG" 2>&1 || return 1
+        git -C "$CB_SRC" clean -qfd >>"$CB_LOG" 2>&1 || true
+        printf '%s\n' "$_new" > "$CB_HOME/.commit.pending"
+        _date=$(git -C "$CB_SRC" log -1 --format=%cI 2>/dev/null || printf '')
+        [ -n "$_date" ] && printf '%s\n' "$_date" > "$CB_HOME/.commit_date.pending"
+        return 0
+    fi
+
+    # Sem git: baixa o tarball do GitHub e compara o conteúdo do cbr.c.
+    if ! have curl && ! have wget; then
+        err "instale 'git' ou 'curl' para baixar a linguagem"
+        return 1
+    fi
+    _tmp=$CB_HOME/.src.tmp
+    rm -rf "$_tmp"
+    mkdir -p "$_tmp" || return 1
+    if ! download "$CBRAZIL_TARBALL_URL" "$_tmp/src.tar.gz"; then
+        rm -rf "$_tmp"; return 1
+    fi
+    if ! tar -xzf "$_tmp/src.tar.gz" -C "$_tmp" >>"$CB_LOG" 2>&1; then
+        rm -rf "$_tmp"; return 1
+    fi
+    _top=$(find "$_tmp" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+    if [ -z "$_top" ] || [ ! -f "$_top/cbr.c" ]; then
+        rm -rf "$_tmp"; return 1
+    fi
+    _new=$(hash_file "$_top/cbr.c")
+    if [ "$_new" = "$_old" ] && [ -x "$CB_TRANSLATOR" ]; then
+        rm -rf "$_tmp"; return 2
+    fi
+    rm -rf "$CB_SRC"
+    if ! mv "$_top" "$CB_SRC"; then rm -rf "$_tmp"; return 1; fi
+    rm -rf "$_tmp"
+    printf 'tar-%s\n' "$_new" > "$CB_HOME/.commit.pending"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$CB_HOME/.commit_date.pending" 2>/dev/null || true
+    return 0
+}
+
+build_translator() {
+    if ! _cc=$(pick_cc); then
+        err "nenhum compilador C encontrado."
+        err "Termux: pkg install clang git | Debian/Ubuntu: sudo apt install gcc git"
+        return 1
+    fi
+    [ -f "$CB_SRC/cbr.c" ] || { err "cbr.c não encontrado em $CB_SRC"; return 1; }
+
+    _out=$CB_HOME/bin/.cbr.new
+    rm -f "$_out"
+    : > "$CB_LOG"
+    # shellcheck disable=SC2086
+    if ! $_cc -std=c11 -Wall -Wextra -Werror -O2 "$CB_SRC/cbr.c" -lm -o "$_out" >>"$CB_LOG" 2>&1; then
+        # shellcheck disable=SC2086
+        if ! $_cc -std=c11 -O2 "$CB_SRC/cbr.c" -lm -o "$_out" >>"$CB_LOG" 2>&1; then
+            err "falha ao compilar o tradutor; detalhes em $CB_LOG"
+            rm -f "$_out"
+            return 1
+        fi
+    fi
+    chmod +x "$_out" 2>/dev/null || true
+    if ! mv -f "$_out" "$CB_TRANSLATOR"; then
+        rm -f "$_out"
+        return 1
+    fi
+    return 0
+}
+
+# Resultado em UPDATE_STATUS: novo | igual | falhou | ocupado
+UPDATE_STATUS="desconhecido"
+
+update_run() {
+    UPDATE_STATUS="falhou"
+    ensure_dirs || return 1
+    if ! acquire_lock; then
+        UPDATE_STATUS="ocupado"
+        return 0
+    fi
+
+    _old=$(cat "$CB_HOME/.commit" 2>/dev/null || printf '')
+    sync_source
+    _rc=$?
+    if [ "$_rc" -eq 2 ]; then
+        UPDATE_STATUS="igual"
+        unlock
+        return 0
+    elif [ "$_rc" -ne 0 ]; then
+        UPDATE_STATUS="falhou"
+        unlock
+        return 1
+    fi
+
+    if ! build_translator; then
+        rm -f "$CB_HOME/.commit.pending" "$CB_HOME/.commit_date.pending"
+        UPDATE_STATUS="falhou"
+        unlock
+        return 1
+    fi
+
+    _new=$(cat "$CB_HOME/.commit.pending" 2>/dev/null || printf '')
+    mv -f "$CB_HOME/.commit.pending" "$CB_HOME/.commit" 2>/dev/null || true
+    if [ -f "$CB_HOME/.commit_date.pending" ]; then
+        mv -f "$CB_HOME/.commit_date.pending" "$CB_HOME/.commit_date" 2>/dev/null || true
+    else
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$CB_HOME/.commit_date" 2>/dev/null || true
+    fi
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$CB_HOME/.last_check" 2>/dev/null || true
+
+    if [ "$_new" = "$_old" ]; then
+        UPDATE_STATUS="igual"
+    else
+        UPDATE_STATUS="novo"
+        printf '%s\n' "$_new" > "$CB_HOME/.pending_notice" 2>/dev/null || true
+        # Tradutor novo: invalida os programas compilados em cache.
+        rm -rf "$CB_CACHE"/* 2>/dev/null || true
+    fi
+
+    unlock
+    return 0
+}
+
+maybe_auto_update() {
+    [ "${CBRAZIL_NO_UPDATE:-0}" = "1" ] && return 0
+    [ -n "${CBRAZIL_SOURCE_DIR:-}" ] && return 0
+    [ -d "$CB_HOME" ] && [ -w "$CB_HOME" ] || return 0
+    _now=$(date +%s 2>/dev/null || printf '0')
+    _last=$(cat "$CB_HOME/.last_check_epoch" 2>/dev/null || printf '0')
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ $((_now - _last)) -lt "$CBRAZIL_UPDATE_INTERVAL" ]; then return 0; fi
+    printf '%s\n' "$_now" > "$CB_HOME/.last_check_epoch" 2>/dev/null || return 0
+    # Em segundo plano: o programa atual roda na versão já instalada.
+    (
+        update_run >/dev/null 2>&1 </dev/null
+    ) >>"$CB_LOG" 2>&1 </dev/null &
+    return 0
+}
+
+notice_if_updated() {
+    [ "${CBRAZIL_QUIET:-0}" = "1" ] && return 0
+    [ -f "$CB_HOME/.pending_notice" ] || return 0
+    _c=$(cat "$CB_HOME/.pending_notice" 2>/dev/null || printf '')
+    rm -f "$CB_HOME/.pending_notice" 2>/dev/null || true
+    [ -n "$_c" ] || return 0
+    msg "linguagem C-Brasil atualizada ($(short_commit "$_c"))"
+}
+
+ensure_installed() {
+    if [ -x "$CB_TRANSLATOR" ] && [ -f "$CB_SRC/cbr.c" ]; then
+        return 0
+    fi
+    msg "preparando a linguagem C-Brasil (primeira execução)..."
+    if ! pick_cc >/dev/null 2>&1; then
+        err "compilador C não encontrado — o C-Brasil precisa dele para rodar."
+        err "Termux: pkg install clang git | Debian/Ubuntu: sudo apt install gcc git"
+        exit 1
+    fi
+    if ! update_run; then
+        if [ "$UPDATE_STATUS" = "ocupado" ]; then
+            msg "outra atualização em andamento; aguardando..."
+            sleep 3
+            update_run || die "não foi possível preparar a linguagem (veja $CB_LOG)"
+        else
+            die "não foi possível preparar a linguagem (veja $CB_LOG)"
+        fi
+    fi
+    [ -x "$CB_TRANSLATOR" ] || die "tradutor não foi gerado (veja $CB_LOG)"
+}
+
+# ---------------------------------------------------------------------------
+# Compilação e execução
+# ---------------------------------------------------------------------------
+
+prune_cache() {
+    [ -d "$CB_CACHE" ] || return 0
+    find "$CB_CACHE" -maxdepth 1 -name 'stdin.*.cbr' -mtime +1 -exec rm -f {} + 2>/dev/null
+    _n=$(ls -1 "$CB_CACHE" 2>/dev/null | wc -l | tr -d ' ')
+    case "$_n" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_n" -le "$CBRAZIL_CACHE_MAX" ] && return 0
+    _keep=$((CBRAZIL_CACHE_MAX / 2))
+    ls -1dt "$CB_CACHE"/*/ 2>/dev/null | tail -n +$((_keep + 1)) | while IFS= read -r _d; do
+        rm -rf "$_d"
+    done
+}
+
+# Compila o .cbr (com cache) e substitui o processo pelo programa.
+compile_and_run() {
+    _src=$1
+    shift
+
+    if ! _cc=$(pick_cc); then
+        die "compilador C não encontrado (Termux: pkg install clang)"
+    fi
+
+    ensure_dirs
+    mkdir -p "$CB_CACHE" 2>/dev/null || true
+
+    _key="$(hash_file "$_src")-$(build_id)"
+    _dir=$CB_CACHE/$_key
+    if [ -x "$_dir/prog" ]; then
+        notice_if_updated
+        exec "$_dir/prog" "$@"
+    fi
+
+    _tmp=$(mktemp -d "$CB_CACHE/.tmp.XXXXXX" 2>/dev/null) || _tmp=$(mktemp -d)
+
+    "$CB_TRANSLATOR" "$_src" "$_tmp/programa.c" >/dev/null
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        rm -rf "$_tmp"
+        exit "$_rc"
+    fi
+
+    # shellcheck disable=SC2086
+    if ! $_cc -std=c11 -O2 "$_tmp/programa.c" -lm -o "$_tmp/prog" 2>"$_tmp/erro.txt"; then
+        err "o código C gerado não compilou:"
+        cat "$_tmp/erro.txt" >&2
+        rm -rf "$_tmp"
+        exit 1
+    fi
+    rm -f "$_tmp/erro.txt"
+
+    if [ -d "$_dir" ]; then
+        rm -rf "$_tmp"
+    elif ! mv "$_tmp" "$_dir" 2>/dev/null; then
+        mkdir -p "$_dir" 2>/dev/null && cp "$_tmp/prog" "$_dir/prog" 2>/dev/null
+        rm -rf "$_tmp"
+    fi
+    prune_cache
+
+    [ -x "$_dir/prog" ] || die "falha ao preparar o executável"
+    notice_if_updated
+    exec "$_dir/prog" "$@"
+}
+
+resolve_program() { # ecoa o caminho existente ou nada
+    if [ -f "$1" ]; then
+        printf '%s\n' "$1"
+    elif [ -f "$1.cbr" ]; then
+        printf '%s\n' "$1.cbr"
+    fi
+}
+
+run_path() {
+    _arg=$1
+    shift
+    _file=$(resolve_program "$_arg")
+    if [ -z "$_file" ]; then
+        if [ -d "$_arg" ]; then
+            err "é um diretório: $_arg"
+        else
+            err "arquivo não encontrado: $_arg"
+            case "$_arg" in
+                *.*) : ;;
+                *) msg "dica: talvez você quis dizer $_arg.cbr" ;;
+            esac
+        fi
+        exit 2
+    fi
+    ensure_installed
+    maybe_auto_update
+    compile_and_run "$_file" "$@"
+}
+
+run_stdin() {
+    ensure_dirs || exit 1
+    _tmp=$(mktemp "$CB_CACHE/stdin.XXXXXX.cbr" 2>/dev/null) || _tmp="${TMPDIR:-/tmp}/cbrasil-stdin.$$.cbr"
+    cat > "$_tmp" || die "não foi possível ler a entrada padrão"
+    ensure_installed
+    # compile_and_run termina com exec; o arquivo temporário é podado depois.
+    compile_and_run "$_tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Comandos
+# ---------------------------------------------------------------------------
+
+cmd_update() {
+    ensure_dirs || exit 1
+    msg "verificando a linguagem em $CBRAZIL_REPO_URL ($CBRAZIL_REPO_BRANCH)..."
+    if ! update_run; then
+        case "$UPDATE_STATUS" in
+            ocupado) die "outra atualização já está em andamento" ;;
+            *) die "não foi possível atualizar (veja $CB_LOG)" ;;
+        esac
+    fi
+    _c=$(cat "$CB_HOME/.commit" 2>/dev/null || printf '?')
+    case "$UPDATE_STATUS" in
+        novo)  msg "C-Brasil atualizado para $(short_commit "$_c") — $(translator_version)" ;;
+        igual) msg "já está na versão mais recente ($(short_commit "$_c")) — $(translator_version)" ;;
+    esac
+    # O comando já informou a atualização: não repete o aviso na próxima execução.
+    rm -f "$CB_HOME/.pending_notice" 2>/dev/null || true
+    exit 0
+}
+
+cmd_doctor() {
+    _ok=0
+    printf '%s %s — diagnóstico\n' "$PROG" "$CBRAZIL_LAUNCHER_VERSION"
+    printf '  instalação : %s\n' "$CB_HOME"
+    printf '  comando    : %s\n' "$(command -v "$PROG" 2>/dev/null || printf 'não está no PATH')"
+    if [ -x "$CB_TRANSLATOR" ]; then
+        printf '  linguagem  : %s\n' "$(translator_version)"
+        printf '  fonte      : %s (%s)\n' "$(build_id)" "$(friendly_date)"
+    else
+        printf '  linguagem  : NÃO INSTALADA — rode: %s --update\n' "$PROG"
+        _ok=1
+    fi
+    if _cc=$(pick_cc); then
+        _ccpath=$(command -v "$(printf '%s' "$_cc" | cut -d' ' -f1)" 2>/dev/null || printf '?')
+        printf '  compilador : %s (%s)\n' "$_cc" "$_ccpath"
+    else
+        printf '  compilador : AUSENTE — Termux: pkg install clang\n'
+        _ok=1
+    fi
+    if have git; then printf '  git        : sim\n'; else printf '  git        : não (usa tarball)\n'; fi
+    if have curl || have wget; then printf '  download   : sim\n'; else printf '  download   : não\n'; fi
+    _n=$(ls -1 "$CB_CACHE" 2>/dev/null | wc -l | tr -d ' ')
+    printf '  cache      : %s (%s programas)\n' "$CB_CACHE" "$_n"
+    if [ "${CBRAZIL_NO_UPDATE:-0}" = "1" ]; then
+        printf '  atualização: automática desativada (CBRAZIL_NO_UPDATE=1)\n'
+    else
+        printf '  atualização: automática a cada %s s\n' "$CBRAZIL_UPDATE_INTERVAL"
+    fi
+    if have git; then
+        if with_timeout 15 git ls-remote --exit-code --heads "$CBRAZIL_REPO_URL" "$CBRAZIL_REPO_BRANCH" >/dev/null 2>&1; then
+            printf '  repositório: acessível\n'
+        else
+            printf '  repositório: sem resposta agora (offline?)\n'
+        fi
+    fi
+    exit "$_ok"
+}
+
+cmd_where() {
+    printf 'instalação : %s\n' "$CB_HOME"
+    printf 'fonte      : %s\n' "$CB_SRC"
+    printf 'tradutor   : %s\n' "$CB_TRANSLATOR"
+    printf 'cache      : %s\n' "$CB_CACHE"
+    printf 'commit     : %s\n' "$(build_id)"
+    printf 'data       : %s\n' "$(friendly_date)"
+    exit 0
+}
+
+cmd_version() {
+    printf '%s %s (executor C-Brasil)\n' "$PROG" "$CBRAZIL_LAUNCHER_VERSION"
+    if [ -x "$CB_TRANSLATOR" ]; then
+        printf 'linguagem: %s\n' "$(translator_version)"
+        printf 'fonte: vorgweb/C-Brasil @ %s (%s)\n' "$(build_id)" "$(friendly_date)"
+    else
+        printf 'linguagem: ainda não instalada (rode: %s --update)\n' "$PROG"
+    fi
+    exit 0
+}
+
+cmd_generate() {
+    _out=""
+    _file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--saida) shift; _out=${1:-} ;;
+            -*) die "opção desconhecida: $1" ;;
+            *) if [ -z "$_file" ]; then _file=$1; else die "argumentos demais: $1"; fi ;;
+        esac
+        shift
+    done
+    [ -n "$_file" ] || die "uso: $PROG gerar arquivo.cbr [-o saida.c]"
+    _path=$(resolve_program "$_file")
+    [ -n "$_path" ] || die "arquivo não encontrado: $_file"
+    ensure_installed
+    [ -n "$_out" ] || { _base=$(basename "$_path"); _out="${_base%.cbr}.c"; }
+    exec "$CB_TRANSLATOR" "$_path" "$_out"
+}
+
+cmd_build() {
+    _out=""
+    _file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--saida) shift; _out=${1:-} ;;
+            -*) die "opção desconhecida: $1" ;;
+            *) if [ -z "$_file" ]; then _file=$1; else die "argumentos demais: $1"; fi ;;
+        esac
+        shift
+    done
+    [ -n "$_file" ] || die "uso: $PROG compilar arquivo.cbr [-o executavel]"
+    _path=$(resolve_program "$_file")
+    [ -n "$_path" ] || die "arquivo não encontrado: $_file"
+    ensure_installed
+    _cc=$(pick_cc) || die "compilador C não encontrado"
+    if [ -z "$_out" ]; then
+        _base=$(basename "$_path")
+        _out="${_base%.cbr}"
+    fi
+    _tmpc=$(mktemp -d 2>/dev/null) || {
+        ensure_dirs
+        _tmpc=$(mktemp -d "$CB_CACHE/build.XXXXXX" 2>/dev/null) || die "mktemp falhou"
+    }
+    trap 'rm -rf "$_tmpc"' EXIT INT TERM HUP
+    "$CB_TRANSLATOR" "$_path" "$_tmpc/programa.c" >/dev/null || exit 1
+    # shellcheck disable=SC2086
+    $_cc -std=c11 -O2 "$_tmpc/programa.c" -lm -o "$_out" || die "falha ao compilar"
+    rm -rf "$_tmpc"
+    trap - EXIT INT TERM HUP
+    msg "executável gerado: $_out"
+    exit 0
+}
+
+usage() {
+    cat <<EOF
+$PROG $CBRAZIL_LAUNCHER_VERSION — executa programas da linguagem C-Brasil (.cbr)
+
+Uso:
+  $PROG arquivo.cbr [argumentos...]     executa o programa
+  $PROG arquivo                         adiciona .cbr automaticamente
+  $PROG -                               lê o programa da entrada padrão
+  $PROG gerar arquivo.cbr [-o saida.c]  apenas traduz para C
+  $PROG compilar arquivo.cbr [-o bin]   gera um executável nativo
+  $PROG --update                        atualiza a linguagem pelo GitHub
+  $PROG --doctor                        diagnóstico da instalação
+  $PROG --where                         mostra os caminhos usados
+  $PROG --version | --help
+
+A linguagem vem de https://github.com/vorgweb/C-Brasil e é atualizada
+automaticamente a cada $CBRAZIL_UPDATE_INTERVAL segundos, em segundo plano.
+
+Variáveis:
+  CBRAZIL_HOME             pasta da instalação
+  CBRAZIL_NO_UPDATE=1      desativa a atualização automática
+  CBRAZIL_UPDATE_INTERVAL  segundos entre verificações (padrão 21600)
+  CBRAZIL_CACHE            pasta de cache dos programas compilados
+  CBRAZIL_QUIET=1          esconde avisos de atualização
+  CC                       compilador C a usar (cc/gcc/clang)
+
+Exemplos:
+  nano ola.cbr
+  $PROG ola.cbr
+  printf 'printf("oi!")\\nend(0)\\n' | $PROG -
+EOF
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    if [ $# -eq 0 ]; then
+        usage >&2
+        exit 2
+    fi
+
+    resolve_home
+
+    # Caminho explícito (com "/" ou ".cbr") vence nomes de comando, então
+    # `cbrasil ./update` executa o arquivo em vez do subcomando.
+    case "$1" in
+        */*|*.cbr)
+            if [ -f "$1" ]; then
+                run_path "$@"
+            fi ;;
+    esac
+
+    case "$1" in
+        -h|--help|help|ajuda)
+            usage
+            exit 0 ;;
+        -V|--version|version|versao)
+            cmd_version ;;
+        --update|update|atualizar|--atualizar)
+            shift
+            cmd_update ;;
+        --doctor|doctor|diagnostico|--diagnostico)
+            cmd_doctor ;;
+        --where|where|onde|--onde)
+            cmd_where ;;
+        gerar|--gerar|traduzir|translate|--traduzir)
+            shift
+            cmd_generate "$@" ;;
+        compilar|--compilar|build)
+            shift
+            cmd_build "$@" ;;
+        -)
+            run_stdin ;;
+        --)
+            shift
+            [ $# -ge 1 ] || { usage >&2; exit 2; }
+            run_path "$@" ;;
+        -*)
+            err "opção desconhecida: $1"
+            usage >&2
+            exit 2 ;;
+        run|executar)
+            shift
+            [ $# -ge 1 ] || die "uso: $PROG run arquivo.cbr"
+            run_path "$@" ;;
+        *)
+            run_path "$@" ;;
+    esac
+}
+
+main "$@"

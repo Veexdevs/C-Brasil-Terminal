@@ -1,0 +1,5 @@
+# artefatos gerados por `cbrasil gerar` / `cbrasil compilar`
+examples/*.c
+examples/ola
+examples/tabuada
+examples/media

@@ -22,7 +22,9 @@ pkg update
 pkg install -y git clang
 
 git clone https://github.com/Veexdevs/C-Brasil-Terminal.git
+cd C-Brasil-Terminal
 sh install.sh
+cd
 ```
 
 Depois disso você pode apagar a pasta clonada: o comando `cbrasil` fica em

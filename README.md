@@ -32,7 +32,6 @@ Depois disso você pode apagar a pasta clonada: o comando `cbrasil` fica em
 Teste:
 
 ```sh
-cd ~
 nano ola.cbr
 ```
 

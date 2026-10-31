@@ -1,0 +1,7 @@
+// Tabuada de 7 usando for range
+numero = 7
+for i in range(1, 11) {
+    valor = numero * i
+    printf("7 x {int.i} = {int.valor}\n")
+}
+end(0)
